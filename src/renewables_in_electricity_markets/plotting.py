@@ -1,14 +1,12 @@
-"""Writing results: tables as CSV + LaTeX, figures as PNG, and the plots shared by steps.
+"""Writing results: tables as CSV, figures as PNG, and the plots shared by steps.
 
 Every step saves into results/<step>/, e.g. save_table(df, "step1", "producers")
-writes results/step1/producers.csv and results/step1/producers.tex. The .tex file
-is a booktabs tabular, ready for \\input{} in the report (needs \\usepackage{booktabs}).
+writes results/step1/producers.csv. The CSVs keep full precision.
 """
 
 from pathlib import Path
 
 import matplotlib.pyplot as plt
-import numpy as np
 import pandas as pd
 
 from renewables_in_electricity_markets.data import MarketData
@@ -34,46 +32,18 @@ def _folder(step: str) -> Path:
     return folder
 
 
-def _tex_escape(text: str) -> str:
-    for char, escaped in [("\\", r"\textbackslash{}"), ("&", r"\&"), ("%", r"\%"), ("$", r"\$"),
-                          ("#", r"\#"), ("_", r"\_"), ("{", r"\{"), ("}", r"\}")]:
-        text = text.replace(char, escaped)
-    return text
-
-
-def to_latex(df: pd.DataFrame, decimals: int = 2, index: bool = True) -> str:
-    """A booktabs tabular for `df`; floats rounded to `decimals`, numbers right-aligned.
-
-    Written by hand because pandas' own to_latex needs jinja2.
-    """
-    if index:
-        df = df.rename_axis(df.index.name or "").reset_index()
-    cells = [[_tex_escape(str(c)) for c in df.columns]]
-    for row in df.itertuples(index=False):
-        cells.append([
-            # + 0.0 turns a rounded -0.0 into 0.0
-            f"{round(v, decimals) + 0.0:,.{decimals}f}" if isinstance(v, float | np.floating) and np.isfinite(v)
-            else "" if v is None or (isinstance(v, float | np.floating) and np.isnan(v))
-            else _tex_escape(str(v))
-            for v in row
-        ])
-    align = "".join("r" if pd.api.types.is_numeric_dtype(df[c]) else "l" for c in df.columns)
-    lines = [f"\\begin{{tabular}}{{{align}}}", r"\toprule", " & ".join(cells[0]) + r" \\", r"\midrule"]
-    lines += [" & ".join(r) + r" \\" for r in cells[1:]]
-    lines += [r"\bottomrule", r"\end{tabular}", ""]
-    return "\n".join(lines)
-
-
-def save_table(df: pd.DataFrame, step: str, name: str, decimals: int = 2, index: bool = True) -> None:
-    """Write results/<step>/<name>.csv (full precision) and <name>.tex (rounded)."""
-    folder = _folder(step)
-    df.to_csv(folder / f"{name}.csv", index=index)
-    (folder / f"{name}.tex").write_text(to_latex(df, decimals, index), encoding="utf-8")
+def save_table(df: pd.DataFrame, step: str, name: str, index: bool = True) -> None:
+    """Write results/<step>/<name>.csv at full precision."""
+    df.to_csv(_folder(step) / f"{name}.csv", index=index)
 
 
 def save_figure(fig: plt.Figure, step: str, name: str) -> None:
-    """Write results/<step>/<name>.png and close the figure."""
-    fig.tight_layout()
+    """Write results/<step>/<name>.png and close the figure.
+
+    A figure-level legend (fig.legend, placed at the bottom) gets a strip of
+    room below the axes; tight_layout would otherwise ignore it.
+    """
+    fig.tight_layout(rect=(0, 0.07, 1, 1) if fig.legends else None)
     fig.savefig(_folder(step) / f"{name}.png")
     plt.close(fig)
 
@@ -87,7 +57,7 @@ def plot_supply_curve(data: MarketData, t: int | None = None, ax=None):
     wind = curve[curve["kind"] == "wind"]
     if not wind.empty:
         # zero-cost bars have no height, so mark the wind block as a shaded span instead
-        ax.axvspan(0, wind["cum_p"].max(), color="tab:green", alpha=0.15, label="Wind (zero cost)")
+        ax.axvspan(0, wind["cum_p"].max(), color="lightgreen", alpha=0.5, label="Wind (zero cost)")
         ax.legend()
     ax.bar(curve["cum_p"] - curve["p_max"], curve["cost"], width=curve["p_max"],
            align="edge", edgecolor="white", color="tab:blue")
@@ -117,15 +87,20 @@ def plot_clearing(data: MarketData, t: int | None = None, ax=None, price: float 
     clearing = clear_graphical(data, t)
     supply, demand = supply_curve(data, t), demand_curve(data, t)
 
+    wind = supply[supply["kind"] == "wind"]
+    if not wind.empty:
+        # zero-cost block has no height on the price axis, so shade it instead
+        ax.axvspan(0, wind["cum_p"].max(), color="lightgreen", alpha=0.5, label="Wind (zero cost)")
     ax.stairs(supply["cost"], [0, *supply["cum_p"]], label="Supply (marginal cost)",
               color="tab:blue", linewidth=2)
     ax.stairs(demand["bid"], [0, *demand["cum_p"]], label="Demand (bid price)",
               color="tab:orange", linewidth=2)
     ax.plot(clearing.quantity, clearing.price, "o", color="red", markersize=9, zorder=5)
     ax.hlines(clearing.price, 0, clearing.quantity, colors="red", linestyles="--")
+    # label to the left of the point, so it does not sit on the demand curve
     ax.annotate(f"Market clearing price\n{clearing.price:.2f} EUR/MWh",
                 (clearing.quantity, clearing.price), textcoords="offset points",
-                xytext=(0, 15), ha="left", color="red")
+                xytext=(-12, 15), ha="right", color="red")
     if price is not None:
         ax.axhline(price, color="black", linestyle=":", linewidth=1,
                    label=f"Optimisation price ({price:.2f})")

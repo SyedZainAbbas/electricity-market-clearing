@@ -1,12 +1,11 @@
 [project]
 name = "renewables-in-electricity-markets"
 version = "0.1.0"
-description = "Add your description here"
+description = "Market clearing on the IEEE RTS 24-bus system with wind: day-ahead, network, balancing and reserve markets"
 readme = "README.md"
 requires-python = ">=3.13"
 dependencies = [
     "gurobipy>=13.0.3",
-    "ipykernel>=7.3.0",
     "matplotlib>=3.11.2",
     "numpy>=2.5.3",
     "pandas>=3.0.6",
@@ -19,3 +18,8 @@ renewables-in-electricity-markets = "renewables_in_electricity_markets:main"
 [build-system]
 requires = ["uv_build>=0.12.17,<0.13.0"]
 build-backend = "uv_build"
+
+[dependency-groups]
+dev = [
+    "ipykernel>=7.4.0",
+]

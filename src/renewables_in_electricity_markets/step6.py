@@ -15,6 +15,7 @@ Run:  python -m renewables_in_electricity_markets.step6
 """
 
 import matplotlib.pyplot as plt
+import numpy as np
 import pandas as pd
 import pyomo.environ as pyo
 
@@ -24,7 +25,7 @@ from renewables_in_electricity_markets.model import copper_plate_prices
 from renewables_in_electricity_markets.plotting import save_figure, save_table
 from renewables_in_electricity_markets.step5 import HOUR
 
-UP_SHARE, DOWN_SHARE = 0.15, 0.10  # of total demand, from the brief
+UP_SHARE, DOWN_SHARE = 0.15, 0.10  # of total demand, from the assignment
 TOL = 1e-6
 
 
@@ -218,16 +219,61 @@ def report(r: dict) -> None:
     for name, units in r["units"].items():
         save_table(units, "step6", "units_" + name.replace(" ", "_"))
 
-    fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(12, 4))
-    s = r["summary"]
-    s.loc[["lambda_DA", "lambda_up", "lambda_down"]].T.plot.bar(ax=ax1, rot=0)
-    ax1.set(ylabel="Price (EUR/MWh or EUR/MW)", title=f"Energy and reserve prices, hour {HOUR}")
-    flexible = r["data"].conventional.set_index("unit")["flexible"]
-    units = pd.DataFrame({name: u.loc[flexible, "p"] for name, u in r["units"].items()})
-    units.index = [f"G{g}" for g in units.index]
-    units.plot.bar(ax=ax2, rot=0)
-    ax2.set(ylabel="Energy dispatch (MW)", title="Dispatch of the flexible units")
-    save_figure(fig, "step6", "prices_and_dispatch")
+    _plot_prices(r)
+    _plot_schedules(r)
+
+
+def _plot_prices(r: dict) -> None:
+    """Energy and reserve prices per case; no-reserves has no reserve prices."""
+    s = r["summary"].loc[["lambda_DA", "lambda_up", "lambda_down"]]
+    x = np.arange(s.shape[1])
+    fig, ax = plt.subplots(figsize=(8, 4))
+    for k, (row, label, color) in enumerate([
+        ("lambda_DA", "energy (EUR/MWh)", "tab:blue"),
+        ("lambda_up", "up-reserve (EUR/MW)", "tab:orange"),
+        ("lambda_down", "down-reserve (EUR/MW)", "tab:green"),
+    ]):
+        values = s.loc[row].where(s.loc[row].abs() > 1e-9)  # no bar for missing reserve prices
+        bars = ax.bar(x + (k - 1) * 0.27, values, 0.27, color=color, label=label)
+        ax.bar_label(bars, fmt="%.2f", fontsize=7, padding=1)
+    ax.set_xticks(x, s.columns)
+    ax.set(ylabel="Price", title=f"Energy and reserve prices, hour {HOUR}")
+    ax.margins(y=0.12)
+    ax.legend(fontsize=8)
+    save_figure(fig, "step6", "prices")
+
+
+def _plot_schedules(r: dict) -> None:
+    """Energy schedule and reserves of the flexible units, sequential vs joint.
+
+    Per unit: the blue bar is its energy schedule, the green hatched part inside
+    it the down-reserve (which needs that much output to be able to reduce), the
+    orange part on top the up-reserve (headroom held back). Down-reserves too thin
+    to see are labelled.
+    """
+    conv = r["data"].conventional.set_index("unit")
+    flexible = conv.index[conv["flexible"]]
+    x = np.arange(len(flexible))
+    fig, axes = plt.subplots(1, 2, figsize=(13, 4.2), sharey=True)
+    for ax, case in zip(axes, ("sequential", "joint")):
+        u = r["units"][case].loc[flexible]
+        ax.bar(x, u["p"], 0.7, color="tab:blue", label="day-ahead schedule")
+        ax.bar(x, u["r_down"], 0.7, color="none", edgecolor="tab:green", hatch="///",
+               label="down-reserve (within the schedule)")
+        ax.bar(x, u["r_up"], 0.7, bottom=u["p"], color="tab:orange", label="up-reserve")
+        # down-reserves too thin to see on this scale (e.g. G5's 1.8 MW in the sequential case)
+        for i, g in enumerate(flexible):
+            if 0 < u.at[g, "r_down"] < 15:
+                top = u.at[g, "p"] + u.at[g, "r_up"]
+                ax.annotate(f"down-reserve\n{u.at[g, 'r_down']:.1f} MW", (i, top),
+                            textcoords="offset points", xytext=(0, 4), ha="center",
+                            fontsize=7, color="tab:green")
+        ax.set_xticks(x, [f"G{g}" for g in flexible])
+        ax.set(title=f"{case.capitalize()} (energy price {r['summary'].at['lambda_DA', case]:.2f})")
+    axes[0].set(ylabel="MW")
+    handles, labels = axes[0].get_legend_handles_labels()
+    fig.legend(handles, labels, loc="lower center", ncol=3, fontsize=8, frameon=False)
+    save_figure(fig, "step6", "schedules")
 
 
 def main() -> None:

@@ -1,18 +1,29 @@
-# Python-generated files
+# Python
 __pycache__/
 *.py[oc]
 build/
 dist/
 wheels/
 *.egg-info
+.ipynb_checkpoints/
 
 # Virtual environments
 .venv
 
-# Solver artefacts written by playground.py
+# Solver model files written for inspection (m.write)
 *.lp
 
 # LaTeX build files
 *.aux
 *.log
+*.out
+*.toc
+*.lof
+*.lot
 *.synctex.gz
+
+# Editors and OS
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db

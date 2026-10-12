@@ -12,6 +12,7 @@ Run:  python -m renewables_in_electricity_markets.step5
 """
 
 import matplotlib.pyplot as plt
+import numpy as np
 import pandas as pd
 import pyomo.environ as pyo
 
@@ -113,7 +114,7 @@ def run() -> dict:
     delta_p = -(conv["dev"].sum() + wind["dev"].sum())  # positive = system short
 
     # A unit can regulate up by its DA headroom and down by its DA output; that is
-    # the "if possible, depending on their day-ahead schedule" in the brief.
+    # the "if possible, depending on their day-ahead schedule" in the assignment.
     offers = conv[conv["flexible"] & (conv.index != OUTAGE)].copy()
     offers["up_max"] = offers["p_max"] - offers["p_da"]
     offers["down_max"] = offers["p_da"]
@@ -178,16 +179,28 @@ def report(r: dict) -> None:
                "step5", "profits")
     save_table(p.groupby("kind")[["da_profit", "profit_1", "profit_2"]].sum(), "step5", "profit_totals")
 
+    # producers that deviate (G9, wind) or regulate (G3, G4); everyone else keeps
+    # their day-ahead profit
     changed = p[(p["dev"].abs() > TOL) | (p["up"] > TOL) | (p["down"] > TOL)]
-    fig, ax = plt.subplots(figsize=(10, 4))
-    x = range(len(changed))
-    for k, (col, label) in enumerate([("da_profit", "day-ahead only"), ("profit_1", "one-price"),
-                                      ("profit_2", "two-price")]):
-        ax.bar([i + (k - 1) * 0.27 for i in x], changed[col], width=0.27, label=label)
-    ax.set_xticks(list(x), changed.index)
-    ax.axhline(0, color="black", linewidth=0.8)
-    ax.set(ylabel="Profit (EUR)", title=f"Profits of producers that deviate or regulate, hour {HOUR}")
-    ax.legend()
+    x = np.arange(len(changed))
+    # separate y-axes: the day-ahead profits (up to 6 092) and the final profits
+    # (-837 to 987) have very different scales.
+    # Rounding to cents + 0.0 turns the tie-break's -0.0005 (G3) into a clean 0,
+    # so its label sits above the axis instead of reading "-0" below it.
+    fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(13, 4.2))
+    da = changed["da_profit"].round(2) + 0.0
+    bars = ax1.bar(x, da, color="tab:gray", label="day-ahead only")
+    ax1.bar_label(bars, fmt="%.0f", fontsize=7, padding=1)
+    ax1.set(ylabel="Profit (EUR)", title="Day-ahead profit (no deviations)")
+    for k, (col, label, color) in enumerate([("profit_1", "one-price", "tab:blue"),
+                                             ("profit_2", "two-price", "tab:orange")]):
+        bars = ax2.bar(x + (k - 0.5) * 0.4, changed[col].round(2) + 0.0, 0.4, color=color, label=label)
+        ax2.bar_label(bars, fmt="%.0f", fontsize=6.5, padding=1)
+    ax2.set(ylabel="Profit (EUR)", title="Total profit after balancing and imbalance settlement")
+    for ax in (ax1, ax2):
+        ax.set_xticks(x, changed.index)
+        ax.axhline(0, color="black", linewidth=0.8)
+        ax.legend(fontsize=8)
     save_figure(fig, "step5", "profits")
 
 

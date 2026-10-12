@@ -1,15 +1,17 @@
-"""Step 3: step 1 (one hour, no storage) on a DC network, nodal and zonal.
+"""Step 3: step 1 (hour 22, no storage) on a DC network, nodal and zonal.
 
-Sections
-    1. Nodal market    copper plate + angles, flows, one balance per node
-    2. Price formation which units are marginal, how every other nodal price is a
-                       re-dispatch of them, and the congestion rent
-    3. Sensitivity     cut two lines at a time to 60 % of their base-case flow
-    4. Zonal market    one price per zone, exchanges limited by ATC, then the zonal
-                       dispatch put on the real network to measure overloads
+Sections:
+    1. Network model      copper plate + angles, flows, one balance per node
+    2. Nodal vs copper    dispatch, prices, binding lines, welfare split, and every
+                          nodal price rebuilt from the binding lines with PTDFs
+    3. Line sensitivity   capacity of the most valuable binding line (14-16) from
+                          20 % to 120 % of its limit
+    4. Zonal vs nodal     north/south with the ATC swept down; zonal prices, welfare
+                          split, and the feasibility of the zonal dispatch on the
+                          real network (overloads and the re-dispatch to fix them)
 
 Network assumptions: uniform susceptance B = 500 pu (x = 0.002 pu, from the
-brief), S_base = 100 MVA (assumed; it only rescales the angles), reference angle
+assignment), S_base = 100 MVA (assumed; it only rescales the angles), reference angle
 at node 13 (the RTS-24 slack bus), wind-case line limits (data.load_lines).
 
 Run:  python -m renewables_in_electricity_markets.step3
@@ -20,36 +22,41 @@ import numpy as np
 import pandas as pd
 import pyomo.environ as pyo
 
-from renewables_in_electricity_markets.data import STEP1_HOUR, MarketData, load_lines, load_market_data
-from renewables_in_electricity_markets.model import ClearingResult, build_model, clear_market, extract, solve
+from renewables_in_electricity_markets.data import (
+    STEP1_HOUR,
+    MarketData,
+    load_lines,
+    load_market_data,
+)
+from renewables_in_electricity_markets.model import (
+    ClearingResult,
+    build_model,
+    clear_market,
+    extract,
+    solve,
+)
 from renewables_in_electricity_markets.plotting import save_figure, save_table
 
 HOUR = STEP1_HOUR
-S_BASE = 100.0  # MVA, assumed: the brief does not give one, line limits are in MW
-B = 500.0       # pu, uniform susceptance from the brief (x = 0.002 pu)
-REF = 13        # reference (slack) node
+S_BASE = 100.0  # MVA, assumed: the assignment does not give one, line limits are in MW
+B = 500.0  # pu, uniform susceptance from the assignment (x = 0.002 pu)
+REF = 13  # reference (slack) node
 TOL = 1e-6
 
-# sensitivity: the two lines of each case are cut to CUT x their base-case flow, so both bind
-CUT = 0.6
-CASES = {
-    "A: 13-23, 12-23": [(13, 23), (12, 23)],  # both exits of node 23
-    "B: 14-16, 15-21": [(14, 16), (15, 21)],  # two of the wind-case bottlenecks, tighter
-    "C: 3-24, 15-24": [(3, 24), (15, 24)],    # north-to-south path through node 24
-    "D: 16-17, 17-22": [(16, 17), (17, 22)],  # out of the cheap 17/18/21/22 pocket
-    "E: 9-12, 10-12": [(9, 12), (10, 12)],    # two of the transformers into the south
-}
+# line sensitivity: capacity of the swept line as a share of its own limit
+SWEEP_SCALES = [0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9, 1.0, 1.1, 1.2]
 
-# zonal: ATC starts at the summed capacity of the border lines (as the brief
-# suggests) and is swept down
-ATC_SCALES = [1.0, 0.5, 0.25, 0.1, 0.05]
-SOUTH = set(range(1, 11))
-LAYOUTS = {
-    # 138 kV south vs 230 kV north: 3 farms (600 MW) vs 4 farms (900 MW)
-    "equal": {n: "S" if n in SOUTH else "N" for n in range(1, 25)},
-    # wind-heavy zone W (farms at 3, 5, 7, 16, 21, 22: 1300 MW) vs R (farm at 23: 200 MW)
-    "unequal": {n: "R" if n in {11, 12, 13, 14, 19, 20, 23} else "W" for n in range(1, 25)},
-}
+# zonal: 138 kV south (nodes 1-10, 3 wind farms) vs 230 kV north (11-24, 4 farms).
+# ATC starts at the summed capacity of the border lines (as the assignment
+# suggests) and is cut down.
+ZONES = {n: "S" if n <= 10 else "N" for n in range(1, 25)}
+ATC_SCALES = [1.0, 0.25, 0.1, 0.05]  # cases shown in the bar charts
+# finer grid for the zonal table (the cases above are on it)
+ATC_GRID = [round(1 - 0.05 * k, 2) for k in range(20)]  # 1.00, 0.95, ..., 0.05
+
+SPLIT = ["consumer utility", "conventional profit", "wind profit", "congestion rent"]
+WELFARE_PARTS = SPLIT + ["welfare"]  # the four parts and their sum
+COPPER_COLOR, NODAL_COLOR = "tab:orange", "tab:blue"
 
 
 def line_name(lines: pd.DataFrame, l: int) -> str:
@@ -58,16 +65,26 @@ def line_name(lines: pd.DataFrame, l: int) -> str:
 
 def _node_members(data: MarketData) -> dict:
     """Which conventional units, farms and loads sit at each node."""
+
     def group(df, col):
         return df.drop_duplicates(col).groupby("node")[col].apply(list).to_dict()
-    return {"G": group(data.conventional, "unit"), "W": group(data.wind, "farm"), "D": group(data.demands, "load_id")}
+
+    return {
+        "G": group(data.conventional, "unit"),
+        "W": group(data.wind, "farm"),
+        "D": group(data.demands, "load_id"),
+    }
 
 
 # ----------------------------------------------------------------------------
-# 1. Nodal market
+# 1. Network model
 # ----------------------------------------------------------------------------
-def add_network(m: pyo.ConcreteModel, data: MarketData, lines: pd.DataFrame,
-                capacity: pd.Series | None = None) -> pyo.ConcreteModel:
+def add_network(
+    m: pyo.ConcreteModel,
+    data: MarketData,
+    lines: pd.DataFrame,
+    capacity: pd.Series | None = None,
+) -> pyo.ConcreteModel:
     """Replace the copper-plate balance of `build_model` with a DC network.
 
     Adds nodes N, lines L, limits F_L (from `capacity`, default lines.capacity),
@@ -85,10 +102,14 @@ def add_network(m: pyo.ConcreteModel, data: MarketData, lines: pd.DataFrame,
     m.L = pyo.Set(initialize=lines.index.tolist())
     m.F_L = pyo.Param(m.L, initialize=capacity.to_dict(), mutable=True)
     m.theta = pyo.Var(m.N, m.T)  # rad, free
-    m.flow = pyo.Var(m.L, m.T)   # MW, positive from -> to
+    m.flow = pyo.Var(m.L, m.T)  # MW, positive from -> to
 
-    m.flow_def = pyo.Constraint(m.L, m.T, rule=lambda m, l, t: m.flow[l, t]
-                                == S_BASE * B * (m.theta[from_node[l], t] - m.theta[to_node[l], t]))
+    m.flow_def = pyo.Constraint(
+        m.L,
+        m.T,
+        rule=lambda m, l, t: m.flow[l, t]
+        == S_BASE * B * (m.theta[from_node[l], t] - m.theta[to_node[l], t]),
+    )
     m.flow_max = pyo.Constraint(m.L, m.T, rule=lambda m, l, t: m.flow[l, t] <= m.F_L[l])
     m.flow_min = pyo.Constraint(m.L, m.T, rule=lambda m, l, t: -m.flow[l, t] <= m.F_L[l])
     # angles are only defined up to a constant, so pin the reference node
@@ -96,8 +117,9 @@ def add_network(m: pyo.ConcreteModel, data: MarketData, lines: pd.DataFrame,
 
     def node_balance(m, n, t):
         consumption = sum(m.p_d[d, t] for d in members["D"].get(n, []))
-        production = (sum(m.p_g[g, t] for g in members["G"].get(n, []))
-                      + sum(m.p_w[w, t] for w in members["W"].get(n, [])))
+        production = sum(m.p_g[g, t] for g in members["G"].get(n, [])) + sum(
+            m.p_w[w, t] for w in members["W"].get(n, [])
+        )
         outflow = sum(m.flow[l, t] for l in m.L if from_node[l] == n)
         inflow = sum(m.flow[l, t] for l in m.L if to_node[l] == n)
         return consumption + outflow - inflow - production == 0
@@ -106,7 +128,9 @@ def add_network(m: pyo.ConcreteModel, data: MarketData, lines: pd.DataFrame,
     return m
 
 
-def clear_nodal(data: MarketData, lines: pd.DataFrame, capacity: pd.Series | None = None) -> ClearingResult:
+def clear_nodal(
+    data: MarketData, lines: pd.DataFrame, capacity: pd.Series | None = None
+) -> ClearingResult:
     """Nodal market; `prices` is indexed by (node, t)."""
     m = solve(add_network(build_model(data), data, lines, capacity))
     prices = pd.Series({(n, t): m.dual[m.balance[n, t]] for n in m.N for t in m.T}, name="price")
@@ -114,119 +138,28 @@ def clear_nodal(data: MarketData, lines: pd.DataFrame, capacity: pd.Series | Non
 
 
 def line_table(m: pyo.ConcreteModel, lines: pd.DataFrame, t: int = HOUR) -> pd.DataFrame:
-    """Per line: from_node, to_node, limit, flow and the signed dual mu.
+    """Per line: from_node, to_node, limit, flow, the signed dual mu and binding.
 
-    mu = dual(flow_max) - dual(flow_min); it is non-zero only for binding lines.
-    With it, lambda_n = lambda_REF - sum_l mu_l PTDF[l, n].
+    mu = dual(flow_max) - dual(flow_min): positive when the line is full in its
+    from-to direction, negative when full the other way, zero when not binding.
+    |mu| is what one more MW of capacity on that line would add to welfare.
     """
     table = lines[["from_node", "to_node"]].copy()
     table["limit"] = [pyo.value(m.F_L[l]) for l in m.L]
     table["flow"] = [m.flow[l, t].value for l in m.L]
     table["mu"] = [m.dual[m.flow_max[l, t]] - m.dual[m.flow_min[l, t]] for l in m.L]
+    table["binding"] = table["flow"].abs() > table["limit"] - TOL
     return table
 
 
-def check_with_pandapower(result: ClearingResult, lines: pd.DataFrame, t: int = HOUR) -> float:
-    """Largest gap (MW) between our flows and pandapower's DC power flow.
-
-    pandapower gets only the nodal injections and finds the angles itself. If it
-    reproduces our flows, the flow equations in the Pyomo model are right.
-    """
-    import pandapower as pp  # optional, only used for this cross-check
-
-    z_base = 100.0**2 / S_BASE  # ohm, for vn_kv = 100 kV
-    net = pp.create_empty_network(sn_mva=S_BASE)
-    pp.create_buses(net, 24, vn_kv=100.0, index=list(range(1, 25)))
-    for r in lines.itertuples():
-        pp.create_line_from_parameters(net, from_bus=r.from_node, to_bus=r.to_node, length_km=1.0,
-                                       r_ohm_per_km=0.0, x_ohm_per_km=z_base / B, c_nf_per_km=0.0,
-                                       max_i_ka=100.0)
-    for n, p in net_demand(result, t).items():
-        pp.create_load(net, bus=n, p_mw=p)
-    pp.create_ext_grid(net, bus=REF)
-    pp.rundcpp(net)
-    ours = line_table(result.model, lines, t)["flow"].to_numpy()
-    return float(np.abs(net.res_line["p_from_mw"].to_numpy() - ours).max())
-
-
 # ----------------------------------------------------------------------------
-# 2. Price formation and congestion rent
+# 2. Nodal vs copper plate
 # ----------------------------------------------------------------------------
-def ptdf(lines: pd.DataFrame) -> pd.DataFrame:
-    """PTDF[l, n]: MW on line l per MW injected at node n and withdrawn at REF."""
-    b = S_BASE * B
-    n_nodes = 24
-    Bbus = np.zeros((n_nodes, n_nodes))
-    A = np.zeros((len(lines), n_nodes))  # line-node incidence
-    for i, r in enumerate(lines.itertuples()):
-        f, t = r.from_node - 1, r.to_node - 1
-        A[i, f], A[i, t] = 1, -1
-        Bbus[f, f] += b
-        Bbus[t, t] += b
-        Bbus[f, t] -= b
-        Bbus[t, f] -= b
-    keep = [n for n in range(n_nodes) if n != REF - 1]
-    X = np.zeros((n_nodes, n_nodes))
-    X[np.ix_(keep, keep)] = np.linalg.inv(Bbus[np.ix_(keep, keep)])
-    return pd.DataFrame(b * A @ X, index=lines.index, columns=range(1, n_nodes + 1))
-
-
-def net_demand(result: ClearingResult, t: int = HOUR) -> pd.Series:
-    """Consumption minus production per node (MW), all 24 nodes."""
-    cons = result.consumption.query("t == @t").groupby("node")["p"].sum()
-    prod = result.production.query("t == @t").groupby("node")["p"].sum()
-    return cons.sub(prod, fill_value=0).reindex(range(1, 25), fill_value=0.0)
-
-
-def marginal_units(data: MarketData, result: ClearingResult, t: int = HOUR) -> pd.DataFrame:
-    """Every resource strictly between its limits, i.e. free to set the price at its node.
-
-    Index: label (G2, W7, D4). Columns: node, offer (tie-broken offer, 0 for wind,
-    bid for demand), p, p_max, lmp.
-    """
-    conv = data.conventional.set_index("unit")
-    rows = []
-    for r in result.production.query("t == @t").itertuples():
-        if r.kind == "conventional":
-            p_max, offer, label = conv.at[r.producer, "p_max"], conv.at[r.producer, "offer"], f"G{r.producer}"
-        else:
-            wind = data.wind
-            p_max = wind.loc[(wind["farm"] == r.producer) & (wind["t"] == t), "p_max"].iloc[0]
-            offer, label = 0.0, f"W{r.producer}"
-        if TOL < r.p < p_max - TOL:
-            rows.append((label, r.node, offer, r.p, p_max))
-    for r in result.consumption.query("t == @t").itertuples():
-        if TOL < r.p < r.p_max - TOL:
-            rows.append((f"D{r.load_id}", r.node, r.bid, r.p, r.p_max))
-    marginal = pd.DataFrame(rows, columns=["label", "node", "offer", "p", "p_max"]).set_index("label")
-    marginal["lmp"] = marginal["node"].map(result.prices.xs(t, level="t"))
-    return marginal
-
-
-def price_recipe(marginal: pd.DataFrame, flows: pd.DataFrame, P: pd.DataFrame, lmp: pd.Series) -> pd.DataFrame:
-    """How each nodal price is made of the marginal units' offers.
-
-    Serving 1 extra MW at node n without changing the flow on any binding line
-    needs a re-dispatch dp of the marginal units that solves
-        sum_k dp_k = 1                              (energy balance)
-        sum_k PTDF[l, node_k] dp_k = PTDF[l, n]     (each binding line l)
-    and the price is its cost, sum_k offer_k dp_k. Some dp_k are negative: a unit
-    is turned down to relieve a line.
-
-    Returns one row per node: dp per marginal unit, "price from recipe", "lmp",
-    and "price from duals" = lambda_REF - sum_l mu_l PTDF[l, n].
-    """
-    binding = flows.index[flows["mu"].abs() > TOL]
-    M = np.vstack([np.ones(len(marginal))] + [P.loc[l, marginal["node"]].to_numpy() for l in binding])
-    rows = {}
-    for n in P.columns:
-        rhs = np.concatenate([[1.0], [P.loc[l, n] for l in binding]])
-        dp = np.linalg.solve(M, rhs)
-        rows[n] = dict(zip(marginal.index, dp)) | {"price from recipe": dp @ marginal["offer"].to_numpy()}
-    recipe = pd.DataFrame(rows).T.rename_axis("node")
-    recipe["lmp"] = lmp
-    recipe["price from duals"] = [lmp[REF] - sum(flows.at[l, "mu"] * P.at[l, n] for l in binding) for n in P.columns]
-    return recipe
+def dispatch(result: ClearingResult, t: int = HOUR) -> pd.Series:
+    """Output per producer (index G1.., W1..), in MW."""
+    prod = result.production[result.production["t"] == t]
+    labels = np.where(prod["kind"] == "conventional", "G", "W") + prod["producer"].astype(str)
+    return pd.Series(prod["p"].to_numpy(), index=labels, name="p")
 
 
 def welfare_split(result: ClearingResult) -> dict:
@@ -244,45 +177,94 @@ def welfare_split(result: ClearingResult) -> dict:
         "wind profit": prod.loc[prod["kind"] == "wind", "profit"].sum(),
         "congestion rent": paid_by_load - paid_to_producers,
         "welfare": result.welfare,
-        "paid by load": paid_by_load,
-        "paid to producers": paid_to_producers,
     }
 
 
+def ptdf(lines: pd.DataFrame) -> pd.DataFrame:
+    """PTDF[l, n]: MW on line l when 1 MW is injected at node n and taken out at REF.
+
+    DC power flow in matrix form. With b = S_base * B (MW per rad, the same for
+    every line):
+      - A (lines x nodes) is +1 at the from node and -1 at the to node, so
+        flow = b * A @ theta;
+      - the nodal injections are what leaves through the lines,
+        injection = A.T @ flow = Bbus @ theta with Bbus = b * A.T @ A;
+      - remove the REF row and column (theta_REF = 0) and invert: theta = X @ injection.
+    So flow = (b * A @ X) @ injection and PTDF = b * A @ X. The REF column is
+    zero: injecting and withdrawing at the same node moves nothing.
+    """
+    nodes = range(1, 25)
+    b = S_BASE * B
+    A = pd.DataFrame(0.0, index=lines.index, columns=nodes)
+    for l, r in lines.iterrows():
+        A.at[l, r.from_node], A.at[l, r.to_node] = 1.0, -1.0
+    Bbus = b * A.T @ A  # diagonal: b x number of lines at the node; off-diagonal: -b per line
+    keep = [n for n in nodes if n != REF]
+    X = pd.DataFrame(0.0, index=nodes, columns=nodes)
+    X.loc[keep, keep] = np.linalg.inv(Bbus.loc[keep, keep].to_numpy())
+    return b * A @ X
+
+
+def lmp_from_ptdf(lmp: pd.Series, flows: pd.DataFrame, P: pd.DataFrame) -> pd.DataFrame:
+    """Rebuild every nodal price from the reference price and the binding lines.
+
+    lambda_n = lambda_REF - sum_l mu_l * PTDF[l, n]
+
+    One more MW consumed at node n (supplied from REF) changes the flow on line
+    l by -PTDF[l, n]. On a binding line that flow is worth mu_l per MW (its
+    dual), so each binding line adds -mu_l * PTDF[l, n] to the price at n.
+    Non-binding lines have mu = 0 and add nothing.
+
+    Returns one row per node: the solver's lmp, the reference price, the
+    contribution of each binding line (column = line name), and their sum
+    "lmp from ptdf", which must equal the lmp.
+    """
+    binding = flows[flows["binding"]]
+    table = pd.DataFrame({"lmp": lmp, f"lambda_{REF}": lmp[REF]})
+    for l, row in binding.iterrows():
+        table[f"{row.from_node}-{row.to_node}"] = -row["mu"] * P.loc[l]
+    table["lmp from ptdf"] = table.drop(columns="lmp").sum(axis=1)
+    return table.rename_axis("node")
+
+
 # ----------------------------------------------------------------------------
-# 3. Line-capacity sensitivity
+# 3. Line sensitivity
 # ----------------------------------------------------------------------------
-def sensitivity(data: MarketData, lines: pd.DataFrame, base: ClearingResult) -> dict:
-    """Clear each case of CASES on a fresh model; returns {case: dict(welfare, lmp, flows, cut)}."""
-    base_flows = line_table(base.model, lines)
-    line_id = {(r.from_node, r.to_node): l for l, r in lines.iterrows()}
-    out = {"base": {"welfare": base.welfare, "lmp": base.prices.xs(HOUR, level="t"), "flows": base_flows, "cut": []}}
-    for name, pairs in CASES.items():
-        cut = [line_id[p] for p in pairs]
+def capacity_sweep(
+    data: MarketData, lines: pd.DataFrame, line: int
+) -> tuple[pd.DataFrame, pd.DataFrame]:
+    """Clear the nodal market with `line`'s capacity scaled by each SWEEP_SCALES.
+
+    Returns (summary with one row per scale: capacity, nodal price range, prices
+    at the line's two end nodes, the line's |dual|, welfare split and binding
+    lines; nodal prices, one column per scale).
+    """
+    a, b = lines.at[line, "from_node"], lines.at[line, "to_node"]
+    rows, lmps = [], {}
+    for scale in SWEEP_SCALES:
         capacity = lines["capacity"].copy()
-        capacity[cut] = CUT * base_flows.loc[cut, "flow"].abs()
+        capacity[line] *= scale
         res = clear_nodal(data, lines, capacity)
-        out[name] = {"welfare": res.welfare, "lmp": res.prices.xs(HOUR, level="t"),
-                     "flows": line_table(res.model, lines), "cut": cut}
-    return out
+        lmp = res.prices.xs(HOUR, level="t")
+        flows = line_table(res.model, lines)
+        lmps[scale] = lmp
+        rows.append({
+            "scale": scale,
+            "capacity": capacity[line],
+            "lmp_min": lmp.min(),
+            "lmp_max": lmp.max(),
+            f"lmp_{a}": lmp[a],
+            f"lmp_{b}": lmp[b],
+            "dual": abs(flows.at[line, "mu"]),
+            **welfare_split(res),
+            "binding": ", ".join(line_name(lines, l) for l in flows.index[flows["binding"]]),
+        })
+    return pd.DataFrame(rows).set_index("scale"), pd.DataFrame(lmps).rename_axis("node")
 
 
 # ----------------------------------------------------------------------------
-# 4. Zonal market
+# 4. Zonal vs nodal
 # ----------------------------------------------------------------------------
-def is_connected(nodes, lines: pd.DataFrame) -> bool:
-    """Zones must be contiguous, otherwise "lines between zones" means little."""
-    nodes, seen, todo = set(nodes), set(), [min(nodes)]
-    while todo:
-        n = todo.pop()
-        seen.add(n)
-        for r in lines.itertuples():
-            for a, b in [(r.from_node, r.to_node), (r.to_node, r.from_node)]:
-                if a == n and b in nodes and b not in seen:
-                    todo.append(b)
-    return seen == nodes
-
-
 def borders(zone_of: dict, lines: pd.DataFrame) -> dict:
     """ATC per zone pair (a, b) = summed capacity of the lines between them."""
     atc = {}
@@ -317,60 +299,108 @@ def clear_zonal(data: MarketData, zone_of: dict, atc: dict) -> ClearingResult:
     # same sign convention as before: consumption + exports - production == 0
     def zone_balance(m, k, t):
         consumption = sum(m.p_d[d, t] for d in in_zone("D", k))
-        production = sum(m.p_g[g, t] for g in in_zone("G", k)) + sum(m.p_w[w, t] for w in in_zone("W", k))
-        exports = sum(m.x[a, b, t] for a, b in m.X if a == k) - sum(m.x[a, b, t] for a, b in m.X if b == k)
+        production = sum(m.p_g[g, t] for g in in_zone("G", k)) + sum(
+            m.p_w[w, t] for w in in_zone("W", k)
+        )
+        exports = sum(m.x[a, b, t] for a, b in m.X if a == k) - sum(
+            m.x[a, b, t] for a, b in m.X if b == k
+        )
         return consumption + exports - production == 0
 
     m.balance = pyo.Constraint(m.Z, m.T, rule=zone_balance)
     solve(m)
-    prices = pd.Series({(n, t): m.dual[m.balance[zone_of[n], t]] for n in zone_of for t in m.T}, name="price")
+    prices = pd.Series(
+        {(n, t): m.dual[m.balance[zone_of[n], t]] for n in zone_of for t in m.T}, name="price"
+    )
     return extract(m, data, prices.rename_axis(["node", "t"]))
 
 
-def overloads(result: ClearingResult, lines: pd.DataFrame, P: pd.DataFrame) -> pd.Series:
-    """MW above the limit per line when `result`'s dispatch flows on the real network."""
-    injection = -net_demand(result)
-    flows = P.to_numpy() @ injection.to_numpy()
-    return (np.abs(flows) - lines["capacity"]).clip(lower=0)
+def zone_average(result: ClearingResult) -> dict:
+    """Load-weighted average price per zone: what the zone's consumers pay on average."""
+    cons = result.consumption.assign(zone=result.consumption["node"].map(ZONES))
+    paid = (cons["price"] * cons["p"]).groupby(cons["zone"]).sum()
+    return (paid / cons.groupby("zone")["p"].sum()).to_dict()
 
 
-def zonal_study(data: MarketData, lines: pd.DataFrame, nodal: ClearingResult, P: pd.DataFrame) -> pd.DataFrame:
-    """Nodal reference plus every layout x ATC scale, one row each.
+def network_flows(data: MarketData, lines: pd.DataFrame, result: ClearingResult) -> pd.Series:
+    """Line flows (MW) if `result`'s dispatch is put on the real network.
 
-    Columns: layout, atc_scale, atc, exchange, prices, the welfare split
-    (welfare, utility, conv_profit, wind_profit, rent) and the overloads of the
-    dispatch on the real network (n_overloaded, max_overload, total_overload,
-    overloaded).
+    A DC power flow with the same equations as the nodal market: every
+    injection and withdrawal is fixed to the dispatch, the line limits are
+    dropped, and the angles follow.
+    """
+    m = add_network(build_model(data), data, lines)
+    for limit in (m.gen_limit, m.wind_limit, m.dem_limit, m.flow_max, m.flow_min):
+        limit.deactivate()
+    p = result.production.set_index(["kind", "producer", "t"])["p"]
+    for g, t in m.p_g:
+        m.p_g[g, t].fix(p["conventional", g, t])
+    for w, t in m.p_w:
+        m.p_w[w, t].fix(p["wind", w, t])
+    served = result.consumption.set_index(["load_id", "t"])["p"]
+    for d, t in m.p_d:
+        m.p_d[d, t].fix(served[d, t])
+    solve(m)
+    return pd.Series({l: m.flow[l, HOUR].value for l in m.L}, name="flow")
+
+
+def overloads(flows: pd.Series, lines: pd.DataFrame) -> pd.Series:
+    """MW above the limit per line (0 where the line is within its limit)."""
+    return (flows.abs() - lines["capacity"]).clip(lower=0)
+
+
+def redispatch(zonal: ClearingResult, nodal: ClearingResult) -> pd.Series:
+    """Change in output per producer (MW) to go from the zonal to the nodal dispatch.
+
+    The nodal dispatch is the cheapest dispatch that respects every line for the
+    same (fully served) demand, so it is the least-cost re-dispatch that makes a
+    zonal outcome feasible. Positive: turn up; negative: turn down.
+    """
+    return (dispatch(nodal) - dispatch(zonal)).rename("redispatch")
+
+
+def zonal_study(
+    data: MarketData, lines: pd.DataFrame, nodal: ClearingResult
+) -> tuple[pd.DataFrame, dict]:
+    """Nodal reference plus the zonal market at every ATC scale, one row each.
+
+    Returns (table, {atc_scale: re-dispatch Series}). Table columns: case,
+    atc_scale, atc, exchange (MW, positive N -> S), price_N, price_S (zonal
+    prices; for the nodal row the load-weighted nodal average per zone), the
+    welfare split, the overloads of the dispatch on the real network
+    (n_overloaded, total_overload, overloaded), and the re-dispatch to the
+    nodal dispatch (redispatch_mw: MW turned up = MW turned down;
+    redispatch_cost: the extra generation cost, negative if the zonal dispatch
+    was the more expensive one).
     """
     def row(result, **info):
-        split = welfare_split(result)
-        over = overloads(result, lines, P)
-        return info | {
-            "welfare": split["welfare"], "utility": split["consumer utility"],
-            "conv_profit": split["conventional profit"], "wind_profit": split["wind profit"],
-            "rent": split["congestion rent"],
-            "n_overloaded": int((over > TOL).sum()), "max_overload": over.max(), "total_overload": over.sum(),
-            "overloaded": ", ".join(f"{line_name(lines, l)} (+{v:.0f})" for l, v in over[over > TOL].items()),
+        over = overloads(network_flows(data, lines, result), lines)
+        return info | welfare_split(result) | {
+            "n_overloaded": int((over > TOL).sum()),
+            "total_overload": over.sum(),
+            "overloaded": ", ".join(
+                f"{line_name(lines, l)} (+{v:.0f})" for l, v in over[over > TOL].items()
+            ),
         }
 
-    lmp = nodal.prices.xs(HOUR, level="t")
-    rows = [row(nodal, layout="nodal", atc_scale=np.nan, prices=f"{lmp.min():.2f}-{lmp.max():.2f}")]
-    for name, zone_of in LAYOUTS.items():
-        for k in set(zone_of.values()):
-            assert is_connected([n for n in zone_of if zone_of[n] == k], lines), f"{name}: zone {k} not contiguous"
-        full_atc = borders(zone_of, lines)
-        for scale in ATC_SCALES:
-            atc = {k: v * scale for k, v in full_atc.items()}
-            res = clear_zonal(data, zone_of, atc)
-            m = res.model
-            price = {k: m.dual[m.balance[k, HOUR]] for k in m.Z}
-            rows.append(row(
-                res, layout=name, atc_scale=scale,
-                atc=", ".join(f"{a}-{b} {v:.0f}" for (a, b), v in atc.items()),
-                exchange=", ".join(f"{a}->{b} {m.x[a, b, HOUR].value:.0f}" for a, b in m.X),
-                prices=", ".join(f"{k} {price[k]:.2f}" for k in m.Z),
-            ))
-    return pd.DataFrame(rows)
+    avg = zone_average(nodal)
+    rows = [row(nodal, case="nodal", atc_scale=np.nan, atc=np.nan, exchange=np.nan,
+                price_N=avg["N"], price_S=avg["S"], redispatch_mw=0.0, redispatch_cost=0.0)]
+    moves = {}
+    full_atc = borders(ZONES, lines)[("N", "S")]
+    for scale in ATC_GRID:
+        res = clear_zonal(data, ZONES, {("N", "S"): scale * full_atc})
+        m = res.model
+        moves[scale] = move = redispatch(res, nodal)
+        rows.append(row(
+            res, case="zonal", atc_scale=scale, atc=scale * full_atc,
+            exchange=m.x["N", "S", HOUR].value,
+            price_N=m.dual[m.balance["N", HOUR]], price_S=m.dual[m.balance["S", HOUR]],
+            redispatch_mw=move.clip(lower=0).sum(),
+            # same demand served, so the welfare difference is the cost difference
+            redispatch_cost=res.welfare - nodal.welfare,
+        ))
+    return pd.DataFrame(rows), moves
 
 
 # ----------------------------------------------------------------------------
@@ -379,121 +409,190 @@ def zonal_study(data: MarketData, lines: pd.DataFrame, nodal: ClearingResult, P:
 def run() -> dict:
     """Everything step 3 reports.
 
-    Keys: data, lines, ptdf, copper (step 1 at this hour, for comparison),
-    nodal (ClearingResult), lmp (Series by node), flows (line_table), marginal,
-    recipe, welfare_split ({"nodal", "copper plate"}: dict), sensitivity, zonal.
+    Keys: data, lines, copper (step 1 at this hour), nodal (ClearingResult),
+    nodal_base (nodal with the original line limits), lmp (Series by node),
+    flows (line_table), dispatch (copper plate vs nodal), ptdf, lmp_ptdf,
+    welfare_split ({"copper plate", "nodal"}), sweep_line, sweep, sweep_lmp,
+    zonal, redispatch.
     """
     r = {"data": load_market_data(hours=[HOUR], storage=None), "lines": load_lines()}
     data, lines = r["data"], r["lines"]
-    r["ptdf"] = P = ptdf(lines)
+
+    # 1-2. nodal vs copper plate
     r["copper"] = clear_market(data)
     r["nodal"] = nodal = clear_nodal(data, lines)
+    r["nodal_base"] = clear_nodal(data, load_lines("base"))  # "are nodal prices identical?"
     r["lmp"] = nodal.prices.xs(HOUR, level="t")
     r["flows"] = line_table(nodal.model, lines)
-    r["marginal"] = marginal_units(data, nodal)
-    r["recipe"] = price_recipe(r["marginal"], r["flows"], P, r["lmp"])
-    r["welfare_split"] = {"nodal": welfare_split(nodal), "copper plate": welfare_split(r["copper"])}
-    r["sensitivity"] = sensitivity(data, lines, nodal)
-    r["zonal"] = zonal_study(data, lines, nodal, P)
+    r["dispatch"] = pd.DataFrame({"copper plate": dispatch(r["copper"]), "nodal": dispatch(nodal)})
+    r["ptdf"] = ptdf(lines)
+    r["lmp_ptdf"] = lmp_from_ptdf(r["lmp"], r["flows"], r["ptdf"])
+    r["welfare_split"] = {"copper plate": welfare_split(r["copper"]), "nodal": welfare_split(nodal)}
+
+    # 3. line sensitivity: the binding line with the largest dual
+    binding = r["flows"][r["flows"]["binding"]]
+    r["sweep_line"] = binding["mu"].abs().idxmax()
+    r["sweep"], r["sweep_lmp"] = capacity_sweep(data, lines, r["sweep_line"])
+
+    # 4. zonal vs nodal
+    r["zonal"], r["redispatch"] = zonal_study(data, lines, nodal)
     return r
 
 
 def check(r: dict) -> None:
-    flows, recipe, split = r["flows"], r["recipe"], r["welfare_split"]["nodal"]
-    binding = flows[flows["mu"].abs() > TOL]
+    flows, split = r["flows"], r["welfare_split"]["nodal"]
+    binding = flows[flows["binding"]]
 
-    # k binding lines leave k + 1 marginal resources, one per degree of freedom
-    assert len(r["marginal"]) == len(binding) + 1, "expected one more marginal unit than binding lines"
-    # both explanations reproduce every nodal price (catches a flipped line dual)
-    assert (recipe["price from recipe"] - recipe["lmp"]).abs().max() < 1e-6, "re-dispatch recipe != lmp"
-    assert (recipe["price from duals"] - recipe["lmp"]).abs().max() < 1e-6, "line duals != lmp"
-    # welfare splits exactly, and the rent is what the binding lines earn
-    parts = split["consumer utility"] + split["conventional profit"] + split["wind profit"] + split["congestion rent"]
+    parts = sum(split[k] for k in SPLIT)
     assert abs(parts - split["welfare"]) < 1e-6, "welfare split does not add up"
-    assert abs((binding["mu"].abs() * binding["limit"]).sum() - split["congestion rent"]) < 1e-4, "rent != mu * limit"
-    # zonal with a non-binding border is the copper plate
-    full = r["zonal"].query("layout == 'equal' and atc_scale == 1.0").iloc[0]
-    assert abs(full["welfare"] - r["copper"].welfare) < 1e-6, "zonal with full ATC should equal copper plate"
-    try:
-        gap = check_with_pandapower(r["nodal"], r["lines"])
-    except ImportError:
-        return
-    assert gap < 1e-6, f"pandapower flows differ by {gap} MW"
+    # the rent is what the binding lines earn: |dual| x capacity
+    rent = (binding["mu"].abs() * binding["limit"]).sum()
+    assert abs(rent - split["congestion rent"]) < 1e-4, "rent != sum |mu| * limit"
+    # original limits: nothing binds, so one price everywhere
+    base_lmp = r["nodal_base"].prices
+    assert base_lmp.max() - base_lmp.min() < 1e-6, "original limits should give one price"
+    # every nodal price follows from the reference price and the binding lines' duals
+    gap = (r["lmp_ptdf"]["lmp from ptdf"] - r["lmp_ptdf"]["lmp"]).abs().max()
+    assert gap < 1e-6, f"PTDF prices differ from the solver's by {gap}"
+    # PTDF and the power-flow replay both reproduce the market's flows
+    nodes = range(1, 25)
+    prod = r["nodal"].production.groupby("node")["p"].sum().reindex(nodes, fill_value=0)
+    cons = r["nodal"].consumption.groupby("node")["p"].sum().reindex(nodes, fill_value=0)
+    assert (r["ptdf"] @ (prod - cons) - flows["flow"]).abs().max() < 1e-6, "PTDF flows"
+    replay = network_flows(r["data"], r["lines"], r["nodal"])
+    assert (replay - flows["flow"]).abs().max() < 1e-6, "network_flows != nodal flows"
+    # zonal with a non-binding border is the copper plate, and its re-dispatch
+    # to nodal costs exactly the welfare the network takes away
+    full = r["zonal"].query("case == 'zonal' and atc_scale == 1.0").iloc[0]
+    assert abs(full["welfare"] - r["copper"].welfare) < 1e-6, "full ATC should equal copper plate"
+    assert abs(full["redispatch_cost"] - (r["copper"].welfare - r["nodal"].welfare)) < 1e-6
 
 
 def report(r: dict) -> None:
-    """Write results/step3/."""
+    """Write results/step3/: tables, then the figures."""
     lines = r["lines"]
     flows = r["flows"].copy()
     flows.index = [line_name(lines, l) for l in flows.index]
-    save_table(r["lmp"].rename("lmp").to_frame(), "step3", "lmp")
+    lmp = pd.DataFrame({"wind-case limits": r["lmp"],
+                        "original limits": r["nodal_base"].prices.xs(HOUR, level="t")})
+    save_table(lmp.rename_axis("node"), "step3", "lmp")
     save_table(flows, "step3", "flows")
-    save_table(flows[flows["mu"].abs() > TOL], "step3", "binding_lines")
-    save_table(r["marginal"], "step3", "marginal_units")
-    save_table(r["recipe"], "step3", "price_recipe", decimals=3)
+    save_table(r["dispatch"].rename_axis("unit"), "step3", "dispatch")
+    save_table(r["lmp_ptdf"], "step3", "lmp_from_ptdf")
     save_table(pd.DataFrame(r["welfare_split"]), "step3", "welfare_split")
+    save_table(r["sweep"], "step3", "sensitivity")
+    save_table(r["sweep_lmp"], "step3", "sensitivity_lmp")
+    save_table(r["zonal"], "step3", "zonal", index=False)
+    moves = pd.DataFrame({f"ATC {s:.0%}": r["redispatch"][s] for s in ATC_SCALES})
+    save_table(moves.rename_axis("unit"), "step3", "redispatch")
 
-    # sensitivity
-    sens = r["sensitivity"]
-    base_welfare = sens["base"]["welfare"]
-    summary = pd.DataFrame({
-        name: {
-            "welfare": s["welfare"], "loss": base_welfare - s["welfare"],
-            "lmp_min": s["lmp"].min(), "lmp_max": s["lmp"].max(),
-            "binding": ", ".join(line_name(lines, l) for l in s["flows"].index
-                                 if abs(s["flows"].at[l, "flow"]) > s["flows"].at[l, "limit"] - TOL),
-        } for name, s in sens.items()
-    }).T.rename_axis("case")
-    save_table(summary, "step3", "sensitivity")
-    cut_rows = [{"case": name, "line": line_name(lines, l), "new limit": s["flows"].at[l, "limit"],
-                 "base flow": sens["base"]["flows"].at[l, "flow"], "flow": s["flows"].at[l, "flow"]}
-                for name, s in sens.items() for l in s["cut"]]
-    save_table(pd.DataFrame(cut_rows), "step3", "sensitivity_cut_lines", decimals=1, index=False)
-    all_flows = pd.DataFrame({name: s["flows"]["flow"] for name, s in sens.items()})
-    all_flows.index = [line_name(lines, l) for l in all_flows.index]
-    save_table(all_flows, "step3", "sensitivity_flows")
-    all_lmp = pd.DataFrame({name: s["lmp"] for name, s in sens.items()})
-    save_table(all_lmp, "step3", "sensitivity_lmp", decimals=3)
+    _plot_nodal_prices(r)
+    _plot_welfare_change(
+        {"nodal": r["welfare_split"]["nodal"]},
+        reference=r["welfare_split"]["copper plate"],
+        colors=[NODAL_COLOR],
+        title="Change in the welfare split, nodal vs copper plate",
+        ylabel="Change vs copper plate (EUR)",
+        name="welfare_split",
+    )
+    _plot_sensitivity(r)
+    _plot_zonal_prices(r)
+    zonal = _bar_cases(r["zonal"])
+    cases = {
+        f"zonal, ATC {row.atc_scale:.0%}": zonal.loc[i, WELFARE_PARTS].to_dict()
+        for i, row in zonal.iloc[1:].iterrows()
+    }
+    _plot_welfare_change(
+        cases,
+        reference=zonal.iloc[0][WELFARE_PARTS].to_dict(),  # the nodal row
+        colors=plt.cm.Oranges(np.linspace(0.85, 0.35, len(cases))),
+        title="Change in the welfare split, zonal vs nodal",
+        ylabel="Change vs nodal (EUR)",
+        name="zonal_welfare_split",
+    )
 
-    # zonal
-    zonal = r["zonal"]
-    save_table(zonal, "step3", "zonal", index=False)
 
-    # figures
+def _plot_nodal_prices(r: dict) -> None:
     fig, ax = plt.subplots(figsize=(10, 4))
-    ax.bar(r["lmp"].index, r["lmp"], color="tab:blue")
-    ax.axhline(r["copper"].price, color="black", linestyle=":", label=f"copper plate ({r['copper'].price:.2f})")
-    ax.set(xlabel="Node", ylabel="Nodal price (EUR/MWh)", title=f"Nodal prices, hour {HOUR}", xticks=range(1, 25))
+    ax.bar(r["lmp"].index, r["lmp"], color=NODAL_COLOR)
+    ax.axhline(r["copper"].price, color="black", linestyle=":",
+               label=f"copper plate ({r['copper'].price:.2f})")
+    ax.set(xlabel="Node", ylabel="Nodal price (EUR/MWh)", title=f"Nodal prices, hour {HOUR}",
+           xticks=range(1, 25))
     ax.legend()
     save_figure(fig, "step3", "nodal_prices")
 
+
+def _plot_welfare_change(
+    cases: dict, reference: dict, colors: list, title: str, ylabel: str, name: str
+) -> None:
+    """Grouped bars: one group per welfare component, one bar per case.
+
+    Each bar is the case's value minus the reference's value of the same
+    component, in EUR (positive: the case gains). Absolute changes rather than
+    percentages, because the copper-plate congestion rent is zero, and because
+    the component changes then add up to the welfare change in the last group.
+    """
+    fig, ax = plt.subplots(figsize=(10 + 0.6 * len(cases), 4.2))
+    x = np.arange(len(WELFARE_PARTS))
+    width = 0.8 / len(cases)
+    for k, (case, split) in enumerate(cases.items()):
+        values = [round(split[c] - reference[c], 6) + 0.0 for c in WELFARE_PARTS]  # + 0.0: no '-0'
+        bars = ax.bar(x + (k - (len(cases) - 1) / 2) * width, values, width,
+                      color=colors[k], label=case)
+        ax.bar_label(bars, fmt="%+.0f", fontsize=6.5, padding=1)
+    ax.axhline(0, color="black", linewidth=0.8)
+    ax.axvline(len(SPLIT) - 0.5, color="gray", linestyle=":", linewidth=1)  # parts | total
+    ax.set_xticks(x, [c.capitalize() for c in SPLIT] + ["Social welfare\n(sum)"])
+    ax.set(ylabel=ylabel, title=title)
+    ax.margins(y=0.12)
+    ax.legend(fontsize=8)
+    save_figure(fig, "step3", name)
+
+
+def _plot_sensitivity(r: dict) -> None:
+    lines, sweep = r["lines"], r["sweep"]
+    name = line_name(lines, r["sweep_line"])
+    a, b = lines.at[r["sweep_line"], "from_node"], lines.at[r["sweep_line"], "to_node"]
+    pct = sweep.index * 100
     fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(12, 4.2))
-    names = list(CASES)
-    ax1.bar(names, summary.loc[names, "loss"].astype(float), color="tab:blue")
-    ax1.set(ylabel="Welfare loss vs base (EUR)", title="Cost of tightening two lines")
-    ax1.tick_params(axis="x", rotation=30)
-    for name, s in sens.items():
-        base = name == "base"
-        ax2.plot(s["lmp"].index, s["lmp"].values, marker="o", ms=3,
-                 color="black" if base else None, lw=2 if base else 1, label=name)
-    ax2.set(xlabel="Node", ylabel="Nodal price (EUR/MWh)", title="Nodal prices")
-    ax2.legend(fontsize=7)
+    ax1.fill_between(pct, sweep["lmp_min"], sweep["lmp_max"], color=NODAL_COLOR, alpha=0.15,
+                     label="range of nodal prices")
+    ax1.plot(pct, sweep[f"lmp_{a}"], marker="o", label=f"node {a}")
+    ax1.plot(pct, sweep[f"lmp_{b}"], marker="o", label=f"node {b}")
+    ax1.axhline(r["copper"].price, color="black", linestyle=":", label="copper plate")
+    ax1.set(xlabel=f"Capacity of line {name} (% of its limit)", ylabel="Price (EUR/MWh)",
+            title="Nodal prices")
+    ax1.legend(fontsize=8)
+    ax2.plot(pct, sweep["dual"], marker="o", color="tab:red")
+    ax2.set(xlabel=f"Capacity of line {name} (% of its limit)", ylabel="Line dual (EUR/MWh)",
+            title=f"Value of 1 MW more on {name}")
     save_figure(fig, "step3", "sensitivity")
 
-    fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(11, 4))
-    for name, zone_of in LAYOUTS.items():
-        sub = zonal[zonal["layout"] == name]
-        for zone in sorted(set(zone_of.values())):
-            price = [float(s.split(f"{zone} ")[1].split(",")[0]) for s in sub["prices"]]
-            ax1.plot(sub["atc_scale"] * 100, price, marker="o", label=f"{name}, zone {zone}")
-        ax2.plot(sub["atc_scale"] * 100, sub["total_overload"], marker="o", label=name)
-    ax1.set(xlabel="ATC (% of border line capacity)", ylabel="Zonal price (EUR/MWh)", title="Zonal prices")
-    ax2.set(xlabel="ATC (% of border line capacity)", ylabel="Sum of line overloads (MW)",
-            title="Overloads on the real network")
-    for ax in (ax1, ax2):
-        ax.legend(fontsize=8)
-        ax.invert_xaxis()
-    save_figure(fig, "step3", "zonal")
+
+def _case_labels(zonal: pd.DataFrame) -> list[str]:
+    return ["nodal\n(zone average)"] + [
+        f"zonal\nATC {s:.0%} ({a:.0f} MW)" for s, a in zip(zonal["atc_scale"][1:], zonal["atc"][1:])
+    ]
+
+
+def _bar_cases(zonal: pd.DataFrame) -> pd.DataFrame:
+    """The nodal row and the ATC_SCALES rows, for the bar charts."""
+    return zonal[(zonal["case"] == "nodal") | zonal["atc_scale"].isin(ATC_SCALES)].reset_index(drop=True)
+
+
+def _plot_zonal_prices(r: dict) -> None:
+    zonal = _bar_cases(r["zonal"])
+    x = np.arange(len(zonal))
+    fig, ax = plt.subplots(figsize=(10, 4.2))
+    for k, (zone, color) in enumerate((("N", NODAL_COLOR), ("S", COPPER_COLOR))):
+        bars = ax.bar(x + (k - 0.5) * 0.38, zonal[f"price_{zone}"], 0.38, color=color,
+                      label="north" if zone == "N" else "south")
+        ax.bar_label(bars, fmt="%.2f", fontsize=7, padding=1)
+    ax.set_xticks(x, _case_labels(zonal), fontsize=8)
+    ax.set(ylabel="Price (EUR/MWh)", title="Zonal prices and load-weighted nodal prices per zone")
+    ax.legend()
+    save_figure(fig, "step3", "zonal_prices")
 
 
 def main() -> None:

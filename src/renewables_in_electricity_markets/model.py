@@ -8,7 +8,7 @@ from it and add what they need in their own file:
     step 5: clears the day-ahead market with it unchanged
 
 Producers are split into two sets, conventional units `m.G` and wind farms
-`m.W`, because the assignment reports their profits separately and step 5 only
+`m.W`, because their profits are reported separately and step 5 only
 perturbs the wind forecast.
 """
 
@@ -39,7 +39,8 @@ def build_model(data: MarketData) -> pyo.ConcreteModel:
                    bounds, so their duals (scarcity rents) come back
         balance    balance[t]: consumption - production == 0. Under `maximize`
                    that sign makes the dual the positive market price.
-        storage    soc[t] (dual = value of stored energy) and e_final
+        storage    soc[t] (dual = value of stored energy), e_max[t], e_min[t]
+                   (duals = value of more / less reservoir in hour t) and e_final
         m.dual     declared here; Pyomo only fills it if it exists before solve()
     """
     conv = data.conventional.set_index("unit")
@@ -51,16 +52,24 @@ def build_model(data: MarketData) -> pyo.ConcreteModel:
     m.D = pyo.Set(initialize=data.demands["load_id"].unique().tolist())
 
     m.P_G = pyo.Param(m.G, initialize=conv["p_max"].to_dict())
-    m.C_G = pyo.Param(m.G, initialize=conv["offer"].to_dict())  # tie-broken, see data.TIE_BREAK
-    m.P_W = pyo.Param(m.W, m.T, initialize=data.wind.set_index(["farm", "t"])["p_max"].to_dict())
-    m.P_D = pyo.Param(m.D, m.T, initialize=data.demands.set_index(["load_id", "t"])["p_max"].to_dict())
-    m.C_D = pyo.Param(m.D, m.T, initialize=data.demands.set_index(["load_id", "t"])["bid"].to_dict())
+    m.C_G = pyo.Param(
+        m.G, initialize=conv["offer"].to_dict()
+    )  # tie-broken, see data.TIE_BREAK
+    m.P_W = pyo.Param(
+        m.W, m.T, initialize=data.wind.set_index(["farm", "t"])["p_max"].to_dict()
+    )
+    m.P_D = pyo.Param(
+        m.D, m.T, initialize=data.demands.set_index(["load_id", "t"])["p_max"].to_dict()
+    )
+    m.C_D = pyo.Param(
+        m.D, m.T, initialize=data.demands.set_index(["load_id", "t"])["bid"].to_dict()
+    )
 
     m.p_g = pyo.Var(m.G, m.T, domain=pyo.NonNegativeReals)
     m.p_w = pyo.Var(m.W, m.T, domain=pyo.NonNegativeReals)
     m.p_d = pyo.Var(m.D, m.T, domain=pyo.NonNegativeReals)
 
-    # total social welfare: wind offers at zero cost and storage bids/offers at zero (Note 2),
+    # total social welfare: wind offers at zero cost and storage bids/offers at zero (as in the assignment),
     # so neither appears in the objective
     m.obj = pyo.Objective(
         expr=sum(m.C_D[d, t] * m.p_d[d, t] for d in m.D for t in m.T)
@@ -69,18 +78,29 @@ def build_model(data: MarketData) -> pyo.ConcreteModel:
     )
 
     m.gen_limit = pyo.Constraint(m.G, m.T, rule=lambda m, g, t: m.p_g[g, t] <= m.P_G[g])
-    m.wind_limit = pyo.Constraint(m.W, m.T, rule=lambda m, w, t: m.p_w[w, t] <= m.P_W[w, t])
-    m.dem_limit = pyo.Constraint(m.D, m.T, rule=lambda m, d, t: m.p_d[d, t] <= m.P_D[d, t])
+    m.wind_limit = pyo.Constraint(
+        m.W, m.T, rule=lambda m, w, t: m.p_w[w, t] <= m.P_W[w, t]
+    )
+    m.dem_limit = pyo.Constraint(
+        m.D, m.T, rule=lambda m, d, t: m.p_d[d, t] <= m.P_D[d, t]
+    )
 
     s = data.storage
     if s is not None:
         m.p_ch = pyo.Var(m.T, bounds=(0, s.p_charge_max))
         m.p_dis = pyo.Var(m.T, bounds=(0, s.p_discharge_max))
-        m.e = pyo.Var(m.T, bounds=(0, s.capacity))
+        # energy limits as constraints, not variable bounds, so their duals come back:
+        # they are what makes the value of stored energy (dual of soc) change between hours
+        m.e = pyo.Var(m.T)
+        m.e_max = pyo.Constraint(m.T, rule=lambda m, t: m.e[t] <= s.capacity)
+        m.e_min = pyo.Constraint(m.T, rule=lambda m, t: m.e[t] >= 0)
 
         def soc_rule(m, t):
             previous = s.e_init if t == m.T.first() else m.e[m.T.prev(t)]
-            return m.e[t] == previous + s.eta_charge * m.p_ch[t] - m.p_dis[t] / s.eta_discharge
+            return (
+                m.e[t]
+                == previous + s.eta_charge * m.p_ch[t] - m.p_dis[t] / s.eta_discharge
+            )
 
         m.soc = pyo.Constraint(m.T, rule=soc_rule)
         m.e_final = pyo.Constraint(expr=m.e[m.T.last()] >= s.e_final_min)
@@ -150,24 +170,35 @@ class ClearingResult:
     @property
     def hourly(self) -> pd.DataFrame:
         """One row per hour: price, what was served and where it came from (copper plate)."""
-        by_kind = self.production.pivot_table(index="t", columns="kind", values="p", aggfunc="sum")
-        summary = pd.DataFrame({
-            "price": self.prices,
-            "served": self.consumption.groupby("t")["p"].sum(),
-            "curtailed": self.consumption.groupby("t").apply(
-                lambda g: (g["p_max"] - g["p"]).sum(), include_groups=False),
-        }).join(by_kind)
+        by_kind = self.production.pivot_table(
+            index="t", columns="kind", values="p", aggfunc="sum"
+        )
+        summary = pd.DataFrame(
+            {
+                "price": self.prices,
+                "served": self.consumption.groupby("t")["p"].sum(),
+                "curtailed": self.consumption.groupby("t").apply(
+                    lambda g: (g["p_max"] - g["p"]).sum(), include_groups=False
+                ),
+            }
+        ).join(by_kind)
         if self.storage is not None:
-            summary = summary.join(self.storage.set_index("t")[["charge", "discharge", "e"]])
+            summary = summary.join(
+                self.storage.set_index("t")[["charge", "discharge", "e"]]
+            )
         return summary
 
 
 def copper_plate_prices(m: pyo.ConcreteModel) -> pd.Series:
     """The dual of each hour's balance, i.e. the uniform price per hour."""
-    return pd.Series({t: m.dual[m.balance[t]] for t in m.T}, name="price").rename_axis("t")
+    return pd.Series({t: m.dual[m.balance[t]] for t in m.T}, name="price").rename_axis(
+        "t"
+    )
 
 
-def extract(m: pyo.ConcreteModel, data: MarketData, prices: pd.Series) -> ClearingResult:
+def extract(
+    m: pyo.ConcreteModel, data: MarketData, prices: pd.Series
+) -> ClearingResult:
     """Read a solved model into tables, settling everyone at the price of their node.
 
     `prices` is indexed by t (one price per hour) or by (node, t) (nodal prices).
@@ -181,31 +212,61 @@ def extract(m: pyo.ConcreteModel, data: MarketData, prices: pd.Series) -> Cleari
         return df["t"].map(prices)
 
     production = pd.DataFrame(
-        [{"producer": g, "kind": "conventional", "node": conv.at[g, "node"], "t": t,
-          "p": m.p_g[g, t].value, "cost": conv.at[g, "cost"]} for g in m.G for t in m.T]
-        + [{"producer": w, "kind": "wind", "node": wind_node.at[w], "t": t,
-            "p": m.p_w[w, t].value, "cost": 0.0} for w in m.W for t in m.T]
+        [
+            {
+                "producer": g,
+                "kind": "conventional",
+                "node": conv.at[g, "node"],
+                "t": t,
+                "p": m.p_g[g, t].value,
+                "cost": conv.at[g, "cost"],
+            }
+            for g in m.G
+            for t in m.T
+        ]
+        + [
+            {
+                "producer": w,
+                "kind": "wind",
+                "node": wind_node.at[w],
+                "t": t,
+                "p": m.p_w[w, t].value,
+                "cost": 0.0,
+            }
+            for w in m.W
+            for t in m.T
+        ]
     )
     production["price"] = price_of(production)
     production["profit"] = (production["price"] - production["cost"]) * production["p"]
 
     consumption = data.demands.copy()
-    consumption["p"] = [m.p_d[d, t].value for d, t in zip(consumption["load_id"], consumption["t"])]
+    consumption["p"] = [
+        m.p_d[d, t].value for d, t in zip(consumption["load_id"], consumption["t"])
+    ]
     consumption["price"] = price_of(consumption)
-    consumption["utility"] = (consumption["bid"] - consumption["price"]) * consumption["p"]
+    consumption["utility"] = (consumption["bid"] - consumption["price"]) * consumption[
+        "p"
+    ]
 
     storage = None
     if data.storage is not None:
-        storage = pd.DataFrame({
-            "t": list(m.T),
-            "charge": [m.p_ch[t].value for t in m.T],
-            "discharge": [m.p_dis[t].value for t in m.T],
-            "e": [m.e[t].value for t in m.T],
-        })
+        storage = pd.DataFrame(
+            {
+                "t": list(m.T),
+                "charge": [m.p_ch[t].value for t in m.T],
+                "discharge": [m.p_dis[t].value for t in m.T],
+                "e": [m.e[t].value for t in m.T],
+            }
+        )
         storage["price"] = storage["t"].map(prices)
-        storage["profit"] = storage["price"] * (storage["discharge"] - storage["charge"])
+        storage["profit"] = storage["price"] * (
+            storage["discharge"] - storage["charge"]
+        )
 
-    welfare = (consumption["bid"] * consumption["p"]).sum() - (production["cost"] * production["p"]).sum()
+    welfare = (consumption["bid"] * consumption["p"]).sum() - (
+        production["cost"] * production["p"]
+    ).sum()
     return ClearingResult(prices, welfare, production, consumption, storage, m)
 
 
@@ -230,15 +291,21 @@ def _resolve_hour(data, t):
 def supply_curve(data: MarketData, t: int | None = None) -> pd.DataFrame:
     """Merit order in hour `t`: units sorted by cost, with label and cumulative capacity cum_p."""
     t = _resolve_hour(data, t)
-    conventional = data.conventional.rename(columns={"unit": "id"}).assign(kind="conventional")
+    conventional = data.conventional.rename(columns={"unit": "id"}).assign(
+        kind="conventional"
+    )
     wind = (
         data.wind[data.wind["t"] == t]
         .rename(columns={"farm": "id"})
         .assign(kind="wind", cost=0.0)
     )
-    curve = pd.concat([conventional, wind], ignore_index=True)[["id", "kind", "node", "p_max", "cost"]]
+    curve = pd.concat([conventional, wind], ignore_index=True)[
+        ["id", "kind", "node", "p_max", "cost"]
+    ]
     curve = curve.sort_values("cost", kind="stable").reset_index(drop=True)
-    curve["label"] = np.where(curve["kind"] == "wind", "W", "G") + curve["id"].astype(str)
+    curve["label"] = np.where(curve["kind"] == "wind", "W", "G") + curve["id"].astype(
+        str
+    )
     curve["cum_p"] = curve["p_max"].cumsum()
     return curve
 
@@ -246,7 +313,9 @@ def supply_curve(data: MarketData, t: int | None = None) -> pd.DataFrame:
 def demand_curve(data: MarketData, t: int | None = None) -> pd.DataFrame:
     """Demand bids in hour `t`, sorted by decreasing price, with cumulative quantity cum_p."""
     t = _resolve_hour(data, t)
-    curve = data.demands[data.demands["t"] == t].sort_values("bid", ascending=False, kind="stable")
+    curve = data.demands[data.demands["t"] == t].sort_values(
+        "bid", ascending=False, kind="stable"
+    )
     curve = curve.reset_index(drop=True)
     curve["cum_p"] = curve["p_max"].cumsum()
     return curve
@@ -285,11 +354,19 @@ def clear_graphical(data: MarketData, t: int | None = None) -> GraphicalClearing
     edges = np.unique([0, *s_cum, *d_cum])
     edges = edges[edges <= min(s_cum[-1], d_cum[-1])]
     mid = (edges[:-1] + edges[1:]) / 2
-    traded = price_at(d_cum, d_price, mid, "left", -np.inf) >= price_at(s_cum, s_price, mid, "left", np.inf)
+    traded = price_at(d_cum, d_price, mid, "left", -np.inf) >= price_at(
+        s_cum, s_price, mid, "left", np.inf
+    )
     if not traded.any():
         return GraphicalClearing(0.0, d_price[0], s_price[0])
 
     q = edges[1:][traded].max()
-    low = max(price_at(s_cum, s_price, q, "left", -np.inf), price_at(d_cum, d_price, q, "right", -np.inf))
-    high = min(price_at(d_cum, d_price, q, "left", np.inf), price_at(s_cum, s_price, q, "right", np.inf))
+    low = max(
+        price_at(s_cum, s_price, q, "left", -np.inf),
+        price_at(d_cum, d_price, q, "right", -np.inf),
+    )
+    high = min(
+        price_at(d_cum, d_price, q, "left", np.inf),
+        price_at(s_cum, s_price, q, "right", np.inf),
+    )
     return GraphicalClearing(q, low, high)
